@@ -1,5 +1,6 @@
 from datetime import datetime
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Request
@@ -11,7 +12,6 @@ app = FastAPI(title="MLflow Model Promotion Gate")
 def parse_iso(ts_str: Any) -> Optional[datetime]:
   if not isinstance(ts_str, str):
     return None
-  # Regex check for YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm)
   pattern = (
       r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$"
   )
@@ -27,7 +27,13 @@ def parse_iso(ts_str: Any) -> Optional[datetime]:
 def is_canonical_pos_int_str(s: Any) -> bool:
   if not isinstance(s, str):
     return False
-  return bool(re.match(r"^[1-9]\d*$", s))
+  if not re.match(r"^[1-9]\d*$", s):
+    return False
+  try:
+    val = int(s)
+    return val <= 9007199254740991
+  except Exception:
+    return False
 
 
 def is_finite_number(val: Any) -> bool:
@@ -35,7 +41,15 @@ def is_finite_number(val: Any) -> bool:
     return False
   if not isinstance(val, (int, float)):
     return False
-  return not (math.isnan(val) or math.isinf(val))
+  return math.isfinite(val)
+
+
+def is_non_neg_int(val: Any) -> bool:
+  if val is None or isinstance(val, bool):
+    return False
+  if not isinstance(val, int):
+    return False
+  return 0 <= val <= 9007199254740991
 
 
 @app.post("/promote")
@@ -53,52 +67,67 @@ async def promote(request: Request):
   policy = body.get("policy")
   versions = body.get("versions")
 
-  # Validate high-level inputs
+  # Mandatory HTTP 400 validations
   if (
       not isinstance(as_of_str, str)
-      or not is_canonical_pos_int_str(champion_version)
+      or parse_iso(as_of_str) is None
+      or not isinstance(champion_version, str)
       or not isinstance(policy, dict)
       or not isinstance(versions, list)
   ):
     return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
 
   as_of_dt = parse_iso(as_of_str)
-  if as_of_dt is None:
-    return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
 
-  # Extract policy fields
+  # Check policy integrity
   req_dataset_digest = policy.get("datasetDigest")
   req_schema_digest = policy.get("schemaDigest")
   max_age_sec = policy.get("maxAgeSeconds")
   acc_floor = policy.get("accuracyFloor")
-  req_slices = policy.get("requiredSlices", {})
+  req_slices = policy.get("requiredSlices")
   max_lat = policy.get("maxLatencyMs")
   max_size = policy.get("maxSizeBytes")
   min_imp = policy.get("minImprovement", 0.01)
 
-  # Validate policy requirements
+  policy_valid = True
   if not (
       isinstance(req_dataset_digest, str)
       and len(req_dataset_digest) > 0
       and isinstance(req_schema_digest, str)
       and len(req_schema_digest) > 0
-      and isinstance(max_age_sec, int)
-      and max_age_sec >= 0
+      and is_non_neg_int(max_age_sec)
       and is_finite_number(acc_floor)
       and 0.0 <= acc_floor <= 1.0
       and isinstance(req_slices, dict)
       and is_finite_number(max_lat)
       and max_lat >= 0
-      and isinstance(max_size, int)
-      and max_size >= 0
+      and is_non_neg_int(max_size)
       and is_finite_number(min_imp)
+      and 0.0 <= min_imp <= 1.0
   ):
-    return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+    policy_valid = False
+
+  if policy_valid:
+    for sk, sv in req_slices.items():
+      if (
+          not isinstance(sk, str)
+          or not is_finite_number(sv)
+          or not (0.0 <= sv <= 1.0)
+      ):
+        policy_valid = False
+        break
+
+  # Pre-scan duplicate versions
+  version_counts: Dict[str, int] = {}
+  for v_entry in versions:
+    if isinstance(v_entry, dict):
+      vid = v_entry.get("version")
+      if isinstance(vid, str):
+        version_counts[vid] = version_counts.get(vid, 0) + 1
 
   failed_gates: Dict[str, List[str]] = {}
-  seen_versions = set()
-  eligible_versions = []
-  version_eval_map = {}
+  eligible_versions: List[str] = []
+  version_eval_map: Dict[str, dict] = {}
 
   for v_entry in versions:
     if not isinstance(v_entry, dict):
@@ -106,78 +135,81 @@ async def promote(request: Request):
 
     v_id = v_entry.get("version")
     v_gates = set()
+    v_key = str(v_id) if v_id is not None else "unknown"
 
-    # Check canonical version
     if not is_canonical_pos_int_str(v_id):
       v_gates.add("INVALID_VERSION")
-      key = str(v_id) if v_id is not None else "unknown"
-      failed_gates[key] = sorted(list(v_gates))
-      continue
 
-    # Check duplicate version
-    if v_id in seen_versions:
+    if isinstance(v_id, str) and version_counts.get(v_id, 0) > 1:
       v_gates.add("DUPLICATE_VERSION")
-      failed_gates[v_id] = sorted(list(v_gates))
-      continue
 
-    seen_versions.add(v_id)
-    art_digest = v_entry.get("artifactDigest")
+    if not policy_valid:
+      v_gates.add("INVALID_POLICY")
+
     eval_obj = v_entry.get("evaluation")
-
     if not isinstance(eval_obj, dict):
       v_gates.add("MISSING_EVALUATION")
-      failed_gates[v_id] = sorted(list(v_gates))
+      failed_gates[v_key] = sorted(list(v_gates))
       continue
 
-    # Timestamp checks
+    # Timestamps
     created_at_str = eval_obj.get("createdAt")
     created_at_dt = parse_iso(created_at_str)
-
     if created_at_dt is None:
       v_gates.add("INVALID_TIMESTAMP")
     else:
       diff_sec = (as_of_dt - created_at_dt).total_seconds()
       if diff_sec < 0:
         v_gates.add("FUTURE_EVALUATION")
-      elif diff_sec > max_age_sec:
+      elif policy_valid and diff_sec > max_age_sec:
         v_gates.add("STALE_EVALUATION")
 
-    # Digest mismatch checks
-    if eval_obj.get("artifactDigest") != art_digest:
+    # Digests
+    art_digest = v_entry.get("artifactDigest")
+    if (
+        eval_obj.get("artifactDigest") != art_digest
+        or not isinstance(art_digest, str)
+        or len(art_digest) == 0
+    ):
       v_gates.add("ARTIFACT_MISMATCH")
-    if eval_obj.get("datasetDigest") != req_dataset_digest:
-      v_gates.add("DATASET_MISMATCH")
-    if eval_obj.get("schemaDigest") != req_schema_digest:
-      v_gates.add("SCHEMA_MISMATCH")
+    if policy_valid:
+      if eval_obj.get("datasetDigest") != req_dataset_digest:
+        v_gates.add("DATASET_MISMATCH")
+      if eval_obj.get("schemaDigest") != req_schema_digest:
+        v_gates.add("SCHEMA_MISMATCH")
 
-    # Aggregate metric checks
+    # Aggregate Metrics
     acc = eval_obj.get("accuracy")
     lat = eval_obj.get("latencyMs")
     sz = eval_obj.get("sizeBytes")
 
-    if (
-        not is_finite_number(acc)
-        or not is_finite_number(lat)
-        or not is_finite_number(sz)
-    ):
+    acc_finite = is_finite_number(acc)
+    lat_finite = is_finite_number(lat)
+    sz_finite = is_non_neg_int(sz)
+
+    if not (acc_finite and lat_finite and sz_finite):
       v_gates.add("NON_FINITE")
     else:
       if not (0.0 <= acc <= 1.0):
         v_gates.add("METRIC_RANGE")
-      elif acc < acc_floor:
+      elif policy_valid and acc < acc_floor:
         v_gates.add("ACCURACY_FLOOR")
 
-      if lat < 0 or lat > max_lat:
+      if lat < 0:
+        v_gates.add("METRIC_RANGE")
+      elif policy_valid and lat > max_lat:
         v_gates.add("LATENCY_LIMIT")
 
-      if sz < 0 or sz > max_size:
+      if sz < 0:
+        v_gates.add("METRIC_RANGE")
+      elif policy_valid and sz > max_size:
         v_gates.add("SIZE_LIMIT")
 
-    # Slices check
+    # Slices
     slices = eval_obj.get("slices")
     if not isinstance(slices, dict):
       v_gates.add("NON_FINITE")
-    else:
+    elif policy_valid:
       for req_s_name, req_s_floor in req_slices.items():
         if req_s_name not in slices:
           v_gates.add(f"MISSING_SLICE:{req_s_name}")
@@ -189,37 +221,37 @@ async def promote(request: Request):
             v_gates.add(f"SLICE_FLOOR:{req_s_name}")
 
     if v_gates:
-      failed_gates[v_id] = sorted(list(v_gates))
+      failed_gates[v_key] = sorted(list(set(v_gates)))
     else:
       eligible_versions.append(v_id)
       version_eval_map[v_id] = eval_obj
 
-  # Champion validity check
+  # Ranking: accuracy desc, latency asc, size asc, version asc
+  def sort_key(vid: str):
+    ev = version_eval_map[vid]
+    return (-ev["accuracy"], ev["latencyMs"], ev["sizeBytes"], int(vid))
+
+  ranked_eligible = sorted(eligible_versions, key=sort_key)
+
   if champion_version not in eligible_versions:
     return {
         "action": "block",
         "championVersion": champion_version,
         "selectedVersion": None,
-        "eligibleVersions": eligible_versions,
+        "eligibleVersions": ranked_eligible,
         "failedGates": failed_gates,
         "aliasMutation": None,
         "evidence": None,
     }
 
-  # Ranking eligible versions: Accuracy DESC, Latency ASC, Size ASC, Version numeric ASC
-  def sort_key(v_id):
-    ev = version_eval_map[v_id]
-    return (-ev["accuracy"], ev["latencyMs"], ev["sizeBytes"], int(v_id))
-
-  ranked = sorted(eligible_versions, key=sort_key)
-  challenger = ranked[0]
+  challenger = ranked_eligible[0]
 
   if challenger == champion_version:
     return {
         "action": "retain",
         "championVersion": champion_version,
         "selectedVersion": champion_version,
-        "eligibleVersions": eligible_versions,
+        "eligibleVersions": ranked_eligible,
         "failedGates": failed_gates,
         "aliasMutation": None,
         "evidence": version_eval_map[champion_version],
@@ -234,7 +266,7 @@ async def promote(request: Request):
         "action": "promote",
         "championVersion": champion_version,
         "selectedVersion": challenger,
-        "eligibleVersions": eligible_versions,
+        "eligibleVersions": ranked_eligible,
         "failedGates": failed_gates,
         "aliasMutation": {"alias": "champion", "version": challenger},
         "evidence": version_eval_map[challenger],
@@ -244,7 +276,7 @@ async def promote(request: Request):
       "action": "retain",
       "championVersion": champion_version,
       "selectedVersion": champion_version,
-      "eligibleVersions": eligible_versions,
+      "eligibleVersions": ranked_eligible,
       "failedGates": failed_gates,
       "aliasMutation": None,
       "evidence": version_eval_map[champion_version],
@@ -252,8 +284,7 @@ async def promote(request: Request):
 
 
 if __name__ == "__main__":
-  import os
+  port = int(os.environ.get("PORT", 8000))
   import uvicorn
 
-  port = int(os.environ.get("PORT", 8000))
   uvicorn.run(app, host="0.0.0.0", port=port)
